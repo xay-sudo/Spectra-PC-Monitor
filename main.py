@@ -1089,7 +1089,7 @@ class SpectraDesktopWidget(QWidget):
         )
         
         self.stays_on_top = False
-        self.widget_opacity = 0.85
+        self.widget_opacity = 0.0 # 100% transparent background
         
         self.drag_start = None
         self.is_dragging = False
@@ -1197,12 +1197,15 @@ class SpectraDesktopWidget(QWidget):
         
         layout.addLayout(power_footer)
         
+        # Install dragging filter on container and all child widgets so you can drag from anywhere!
+        self.install_drag_filter(self.container)
+        
         # Paint style attributes
         self.update_styles()
 
     def update_styles(self):
-        rgba_color = f"rgba(10, 15, 30, {self.widget_opacity})"
-        border_color = f"rgba(255, 255, 255, 0.08)"
+        rgba_color = "transparent" # 100% transparent
+        border_color = "rgba(255, 255, 255, 0.15)" # sleek visible glass border
         
         primary_color = "#00F2FE"
         secondary_color = "#D400FF"
@@ -1351,7 +1354,36 @@ class SpectraDesktopWidget(QWidget):
         except Exception:
             return 12.5
 
-    # Desktop Dragging capabilities
+    # Universal Dragging and Event Interception from any Child Element
+    def install_drag_filter(self, widget):
+        widget.installEventFilter(self)
+        for child in widget.findChildren(QWidget):
+            if not isinstance(child, QPushButton):
+                child.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent, Qt
+        if event.type() == QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.drag_start = event.globalPosition().toPoint()
+                self.window_start = self.pos()
+                self.is_dragging = True
+                return True
+        elif event.type() == QEvent.Type.MouseMove:
+            if self.is_dragging and self.drag_start:
+                delta = event.globalPosition().toPoint() - self.drag_start
+                self.move(self.window_start + delta)
+                return True
+        elif event.type() == QEvent.Type.MouseButtonRelease:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.is_dragging = False
+                return True
+        elif event.type() == QEvent.Type.MouseButtonDblClick:
+            self.open_main_app()
+            return True
+            
+        return super().eventFilter(obj, event)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.drag_start = event.globalPosition().toPoint()
