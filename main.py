@@ -1365,36 +1365,61 @@ class SpectraDesktopWidget(QWidget):
         from PyQt6.QtCore import QEvent, Qt
         if event.type() == QEvent.Type.MouseButtonPress:
             if event.button() == Qt.MouseButton.LeftButton:
-                self.drag_start = event.globalPosition().toPoint()
-                self.window_start = self.pos()
-                self.is_dragging = True
-                return True
+                try:
+                    self.drag_position = event.globalPosition().toPoint() - self.pos()
+                    self.is_dragging = True
+                except Exception:
+                    try:
+                        self.drag_position = event.globalPos() - self.pos()
+                        self.is_dragging = True
+                    except Exception:
+                        pass
+                return False # Allow child to receive click too (non-blocking!)
+                
         elif event.type() == QEvent.Type.MouseMove:
-            if self.is_dragging and self.drag_start:
-                delta = event.globalPosition().toPoint() - self.drag_start
-                self.move(self.window_start + delta)
-                return True
+            if hasattr(self, 'is_dragging') and self.is_dragging and hasattr(self, 'drag_position'):
+                try:
+                    self.move(event.globalPosition().toPoint() - self.drag_position)
+                except Exception:
+                    try:
+                        self.move(event.globalPos() - self.drag_position)
+                    except Exception:
+                        pass
+                return False
+                
         elif event.type() == QEvent.Type.MouseButtonRelease:
             if event.button() == Qt.MouseButton.LeftButton:
                 self.is_dragging = False
-                return True
+                return False
+                
         elif event.type() == QEvent.Type.MouseButtonDblClick:
             self.open_main_app()
-            return True
+            return False
             
         return super().eventFilter(obj, event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.drag_start = event.globalPosition().toPoint()
-            self.window_start = self.pos()
-            self.is_dragging = True
+            try:
+                self.drag_position = event.globalPosition().toPoint() - self.pos()
+                self.is_dragging = True
+            except Exception:
+                try:
+                    self.drag_position = event.globalPos() - self.pos()
+                    self.is_dragging = True
+                except Exception:
+                    pass
             event.accept()
 
     def mouseMoveEvent(self, event):
-        if self.is_dragging and self.drag_start:
-            delta = event.globalPosition().toPoint() - self.drag_start
-            self.move(self.window_start + delta)
+        if hasattr(self, 'is_dragging') and self.is_dragging and hasattr(self, 'drag_position'):
+            try:
+                self.move(event.globalPosition().toPoint() - self.drag_position)
+            except Exception:
+                try:
+                    self.move(event.globalPos() - self.drag_position)
+                except Exception:
+                    pass
             event.accept()
 
     def mouseReleaseEvent(self, event):
