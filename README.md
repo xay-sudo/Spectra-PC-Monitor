@@ -67,8 +67,8 @@ To register Spectra PC Monitor in your Zorin OS Application Start Menu and add a
    Type=Application
    Name=Spectra PC Monitor
    Comment=Premium hardware monitoring and tune-up utility
-   Exec="/home/xay/Desktop/pc info/dist/SpectraMonitor"
-   Icon=/home/xay/Desktop/pc info/app_icon.png
+   Exec="/home/YOUR_USERNAME/Desktop/Spectra-PC-Monitor/dist/SpectraMonitor"
+   Icon=/home/YOUR_USERNAME/Desktop/Spectra-PC-Monitor/app_icon.png
    Terminal=false
    Categories=System;Monitor;
    StartupNotify=true
