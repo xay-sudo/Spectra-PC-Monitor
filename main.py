@@ -11,6 +11,7 @@ import platform
 import math
 
 import psutil
+import sqlite3
 try:
     import GPUtil
 except ImportError:
@@ -22,7 +23,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QHBoxLayout, QVBoxLayout,
     QGridLayout, QLabel, QPushButton, QProgressBar, QStackedWidget, QScrollArea,
     QGraphicsDropShadowEffect, QSizePolicy, QLineEdit, QTableWidget,
-    QTableWidgetItem, QHeaderView, QAbstractItemView, QMessageBox
+    QTableWidgetItem, QHeaderView, QAbstractItemView, QMessageBox, QSpinBox, QSystemTrayIcon, QMenu
 )
 
 def resource_path(relative_path):
@@ -277,6 +278,37 @@ QLineEdit#search_input:focus {
 # -------------------------------------------------------------
 # HARDWARE DETECTOR HELPERS
 # -------------------------------------------------------------
+import glob
+
+def get_hardware_power_usage():
+    try:
+        # Check laptop battery
+        for battery_dir in glob.glob("/sys/class/power_supply/BAT*"):
+            power_now_file = os.path.join(battery_dir, "power_now")
+            current_now_file = os.path.join(battery_dir, "current_now")
+            voltage_now_file = os.path.join(battery_dir, "voltage_now")
+            status_file = os.path.join(battery_dir, "status")
+            
+            status = "Discharging"
+            if os.path.exists(status_file):
+                with open(status_file, "r") as f:
+                    status = f.read().strip()
+            
+            if status == "Discharging":
+                if os.path.exists(power_now_file):
+                    with open(power_now_file, "r") as f:
+                        val = float(f.read().strip())
+                        if val > 0:
+                            return val / 1_000_000.0 # microwatts to Watts
+                elif os.path.exists(current_now_file) and os.path.exists(voltage_now_file):
+                    with open(current_now_file, "r") as f_c, open(voltage_now_file, "r") as f_v:
+                        curr = float(f_c.read().strip())
+                        volt = float(f_v.read().strip())
+                        return (curr * volt) / 1_000_000_000_000.0
+    except Exception:
+        pass
+    return None
+
 def get_cpu_model():
     try:
         with open("/proc/cpuinfo", "r") as f:
@@ -460,6 +492,17 @@ class SidebarButton(QPushButton):
             painter.drawEllipse(QRectF(0, 0, 18, 18))
             painter.drawEllipse(QRectF(5, 0, 8, 18))
             painter.drawLine(0, 9, 18, 9)
+        elif self.icon_type == "energy":
+            poly = QPolygonF([
+                QPointF(11, 0),
+                QPointF(3, 9),
+                QPointF(8, 9),
+                QPointF(6, 18),
+                QPointF(15, 8),
+                QPointF(9, 8),
+                QPointF(11, 0)
+            ])
+            painter.drawPolygon(poly)
         elif self.icon_type == "processes":
             painter.drawRect(QRectF(0, 1, 18, 3))
             painter.drawRect(QRectF(0, 7, 18, 3))
@@ -1028,6 +1071,393 @@ class DiskSpeedTestWorker(QThread):
             self.error.emit(str(e))
 
 # -------------------------------------------------------------
+# GORGEOUS SPECTRA DESKTOP WIDGET (DESKLET)
+# -------------------------------------------------------------
+class SpectraDesktopWidget(QWidget):
+    def __init__(self, main_app=None):
+        super().__init__()
+        self.main_app = main_app
+        self.setWindowTitle("Spectra Widget")
+        self.setFixedSize(320, 190)
+        
+        # Translucent background, frameless tool window (does not show in taskbar)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint | 
+            Qt.WindowType.Tool | 
+            Qt.WindowType.WindowStaysOnBottomHint
+        )
+        
+        self.stays_on_top = False
+        self.widget_opacity = 0.85
+        
+        self.drag_start = None
+        self.is_dragging = False
+        
+        self.init_ui()
+        
+        # Independent timer for widget refresh (1 second interval)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_metrics)
+        self.timer.start(1000)
+        
+        # Initial stats fill
+        self.update_metrics()
+
+    def init_ui(self):
+        # Outer visual capsule container
+        self.container = QFrame(self)
+        self.container.setGeometry(10, 10, 300, 170)
+        self.container.setObjectName("widget_container")
+        
+        # Sleek fluid drop shadow
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(15)
+        shadow.setColor(QColor(0, 0, 0, 180))
+        shadow.setOffset(0, 4)
+        self.container.setGraphicsEffect(shadow)
+        
+        # Internal elements layout
+        layout = QVBoxLayout(self.container)
+        layout.setContentsMargins(15, 12, 15, 12)
+        layout.setSpacing(10)
+        
+        # Widget header row
+        header = QHBoxLayout()
+        
+        self.pulse_dot = QLabel("●")
+        self.pulse_dot.setStyleSheet("color: #00F2FE; font-size: 10px; margin-right: 2px;")
+        header.addWidget(self.pulse_dot)
+        
+        title = QLabel("SPECTRA WIDGET")
+        title.setStyleSheet("color: #ffffff; font-size: 10px; font-weight: 900; letter-spacing: 2px;")
+        header.addWidget(title)
+        header.addStretch()
+        
+        self.lbl_power_top = QLabel("⚡ 0.0 W")
+        self.lbl_power_top.setStyleSheet("color: #ffb300; font-size: 10px; font-weight: 800;")
+        header.addWidget(self.lbl_power_top)
+        
+        layout.addLayout(header)
+        
+        # Thin divider
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("background-color: rgba(255, 255, 255, 0.06); height: 1px; border: none;")
+        layout.addWidget(sep)
+        
+        # CPU/RAM Progress grids
+        grid = QGridLayout()
+        grid.setSpacing(8)
+        grid.setColumnStretch(1, 1)
+        
+        # CPU Metric Row
+        lbl_cpu = QLabel("CPU")
+        lbl_cpu.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 800;")
+        grid.addWidget(lbl_cpu, 0, 0)
+        
+        self.pbar_cpu = QProgressBar()
+        self.pbar_cpu.setValue(0)
+        grid.addWidget(self.pbar_cpu, 0, 1)
+        
+        self.lbl_cpu_val = QLabel("0%")
+        grid.addWidget(self.lbl_cpu_val, 0, 2)
+        
+        # RAM Metric Row
+        lbl_ram = QLabel("RAM")
+        lbl_ram.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 800;")
+        grid.addWidget(lbl_ram, 1, 0)
+        
+        self.pbar_ram = QProgressBar()
+        self.pbar_ram.setValue(0)
+        grid.addWidget(self.pbar_ram, 1, 1)
+        
+        self.lbl_ram_val = QLabel("0%")
+        grid.addWidget(self.lbl_ram_val, 1, 2)
+        
+        layout.addLayout(grid)
+        
+        # Footer layout (Active Power usage)
+        power_footer = QHBoxLayout()
+        power_footer.setSpacing(10)
+        
+        icon_lbl = QLabel("🔌 Power Usage:")
+        icon_lbl.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600;")
+        power_footer.addWidget(icon_lbl)
+        
+        self.lbl_power_watt = QLabel("Calculating...")
+        self.lbl_power_watt.setStyleSheet("color: #ffb300; font-size: 12px; font-weight: 800;")
+        power_footer.addWidget(self.lbl_power_watt)
+        power_footer.addStretch()
+        
+        self.btn_details = QPushButton("⚡ DETAILS")
+        self.btn_details.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_details.clicked.connect(self.open_main_app)
+        power_footer.addWidget(self.btn_details)
+        
+        layout.addLayout(power_footer)
+        
+        # Paint style attributes
+        self.update_styles()
+
+    def update_styles(self):
+        rgba_color = f"rgba(10, 15, 30, {self.widget_opacity})"
+        border_color = f"rgba(255, 255, 255, 0.08)"
+        
+        primary_color = "#00F2FE"
+        secondary_color = "#D400FF"
+        accent_rgb = "0, 242, 254"
+        gradient_cpu = "stop:0 #00F2FE, stop:1 #4FACFE"
+        gradient_ram = "stop:0 #D400FF, stop:1 #ff416c"
+        
+        if self.main_app:
+            theme_name = self.main_app.current_theme
+            palette = self.main_app.theme_palettes.get(theme_name, {})
+            primary_color = palette.get("primary", "#00F2FE")
+            secondary_color = palette.get("secondary", "#D400FF")
+            accent_rgb = palette.get("accent_rgb", "0, 242, 254")
+            
+            if theme_name == "Emerald Green":
+                gradient_cpu = "stop:0 #00ff87, stop:1 #00F2FE"
+                gradient_ram = "stop:0 #00F2FE, stop:1 #D400FF"
+            elif theme_name == "Cyberpunk Red":
+                gradient_cpu = "stop:0 #ff416c, stop:1 #D400FF"
+                gradient_ram = "stop:0 #D400FF, stop:1 #ffb300"
+            elif theme_name == "Neon Amber":
+                gradient_cpu = "stop:0 #ffb300, stop:1 #ff416c"
+                gradient_ram = "stop:0 #ff416c, stop:1 #D400FF"
+                
+        self.pulse_dot.setStyleSheet(f"color: {primary_color}; font-size: 10px; margin-right: 2px;")
+        self.lbl_cpu_val.setStyleSheet(f"color: {primary_color}; font-size: 11px; font-weight: 800; min-width: 35px; text-align: right;")
+        self.lbl_ram_val.setStyleSheet(f"color: {secondary_color}; font-size: 11px; font-weight: 800; min-width: 35px; text-align: right;")
+        
+        self.btn_details.setStyleSheet(f"""
+            QPushButton {{
+                background-color: rgba({accent_rgb}, 0.1);
+                border: 1px solid rgba({accent_rgb}, 0.3);
+                border-radius: 6px;
+                color: {primary_color};
+                font-size: 8px;
+                font-weight: 800;
+                padding: 3px 8px;
+            }}
+            QPushButton:hover {{
+                background-color: {primary_color};
+                color: #080c14;
+            }}
+        """)
+        
+        self.container.setStyleSheet(f"""
+            QFrame#widget_container {{
+                background-color: {rgba_color};
+                border: 1px solid {border_color};
+                border-radius: 16px;
+            }}
+        """)
+        
+        self.pbar_cpu.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: rgba(255, 255, 255, 0.05);
+                border-radius: 4px;
+                height: 8px;
+                text-align: right;
+                color: transparent;
+            }}
+            QProgressBar::chunk {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, {gradient_cpu});
+                border-radius: 4px;
+            }}
+        """)
+        
+        self.pbar_ram.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: rgba(255, 255, 255, 0.05);
+                border-radius: 4px;
+                height: 8px;
+                text-align: right;
+                color: transparent;
+            }}
+            QProgressBar::chunk {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, {gradient_ram});
+                border-radius: 4px;
+            }}
+        """)
+
+    def update_metrics(self):
+        try:
+            # 1. Update CPU overall
+            cpu_usage = psutil.cpu_percent()
+            self.pbar_cpu.setValue(int(cpu_usage))
+            self.lbl_cpu_val.setText(f"{int(cpu_usage)}%")
+            
+            # 2. Update RAM overall
+            mem = psutil.virtual_memory()
+            self.pbar_ram.setValue(int(mem.percent))
+            self.lbl_ram_val.setText(f"{int(mem.percent)}%")
+            
+            # 3. Calculate Power Usage in Watts
+            watts = self.get_power_usage()
+            self.lbl_power_watt.setText(f"{watts:.1f} W")
+            self.lbl_power_top.setText(f"⚡ {watts:.1f} W")
+            
+            # Soft micro-pulse visual effect on active dot
+            if hasattr(self, 'pulse_dot'):
+                current_style = self.pulse_dot.styleSheet()
+                if "rgba" in current_style:
+                    color = "#00F2FE" if not self.main_app else self.main_app.theme_palettes[self.main_app.current_theme]["primary"]
+                    self.pulse_dot.setStyleSheet(f"color: {color}; font-size: 10px; margin-right: 2px;")
+                else:
+                    self.pulse_dot.setStyleSheet("color: rgba(100, 116, 139, 0.6); font-size: 10px; margin-right: 2px;")
+        except Exception:
+            pass
+
+    def get_power_usage(self):
+        # Laptop battery hardware detection
+        hw_power = get_hardware_power_usage()
+        if hw_power is not None:
+            return hw_power
+            
+        # Desktop / Restricted fallback: High fidelity telemetry-driven energy meter
+        try:
+            cpu_usage = psutil.cpu_percent()
+            cpu_model = get_cpu_model()
+            
+            def get_cpu_tdp(model_name):
+                model_lower = model_name.lower()
+                if "u" in model_lower or "y" in model_lower or "g1" in model_lower or "g4" in model_lower or "g7" in model_lower:
+                    return 15.0, 25.0
+                elif "h" in model_lower or "hq" in model_lower or "hs" in model_lower:
+                    return 35.0, 54.0
+                elif "t" in model_lower:
+                    return 35.0, 50.0
+                else:
+                    return 65.0, 125.0
+                    
+            base, peak = get_cpu_tdp(cpu_model)
+            idle_power = base * 0.08
+            
+            freq_ratio = 1.0
+            freq = psutil.cpu_freq()
+            if freq and freq.max > 0:
+                freq_ratio = freq.current / freq.max
+                
+            load_factor = (cpu_usage / 100.0) ** 1.3
+            freq_factor = freq_ratio ** 1.5
+            
+            active_power = (peak - idle_power) * load_factor * freq_factor
+            total_watts = idle_power + active_power
+            
+            return max(3.5, min(total_watts, peak * 1.5))
+        except Exception:
+            return 12.5
+
+    # Desktop Dragging capabilities
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_start = event.globalPosition().toPoint()
+            self.window_start = self.pos()
+            self.is_dragging = True
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.is_dragging and self.drag_start:
+            delta = event.globalPosition().toPoint() - self.drag_start
+            self.move(self.window_start + delta)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.is_dragging = False
+            event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        self.open_main_app()
+        event.accept()
+
+    def open_main_app(self):
+        if self.main_app:
+            self.main_app.show()
+            self.main_app.raise_()
+            self.main_app.activateWindow()
+
+    def toggle_stays_on_top(self):
+        self.stays_on_top = not self.stays_on_top
+        self.update_window_flags()
+
+    def set_widget_opacity(self, value):
+        self.widget_opacity = value
+        self.update_styles()
+
+    def update_window_flags(self):
+        pos = self.pos()
+        if self.stays_on_top:
+            self.setWindowFlags(
+                Qt.WindowType.FramelessWindowHint | 
+                Qt.WindowType.Tool | 
+                Qt.WindowType.WindowStaysOnTopHint
+            )
+        else:
+            self.setWindowFlags(
+                Qt.WindowType.FramelessWindowHint | 
+                Qt.WindowType.Tool | 
+                Qt.WindowType.WindowStaysOnBottomHint
+            )
+        self.show()
+        self.move(pos)
+
+    # Right click premium menu features
+    def contextMenuEvent(self, event):
+        from PyQt6.QtGui import QAction
+        from PyQt6.QtWidgets import QMenu
+        
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #0b0f19;
+                color: #ffffff;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 8px;
+                padding: 5px;
+            }
+            QMenu::item {
+                padding: 6px 20px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: rgba(0, 242, 254, 0.2);
+                color: #00F2FE;
+            }
+        """)
+        
+        act_open = QAction("Open Spectra Monitor", self)
+        act_open.triggered.connect(self.open_main_app)
+        menu.addAction(act_open)
+        
+        menu.addSeparator()
+        
+        top_text = "Always on Top [ON]" if self.stays_on_top else "Always on Top [OFF] (Desklet)"
+        act_top = QAction(top_text, self)
+        act_top.triggered.connect(self.toggle_stays_on_top)
+        menu.addAction(act_top)
+        
+        opacity_menu = menu.addMenu("Widget Opacity")
+        opacity_menu.setStyleSheet(menu.styleSheet())
+        
+        opacities = [("Solid", 1.0), ("High Glass", 0.85), ("Medium Glass", 0.7), ("Low Glass", 0.5)]
+        for label, val in opacities:
+            act_op = QAction(f"{label} ({int(val*100)}%)", self)
+            act_op.triggered.connect(lambda checked, v=val: self.set_widget_opacity(v))
+            opacity_menu.addAction(act_op)
+            
+        menu.addSeparator()
+        
+        act_close = QAction("Close Widget", self)
+        act_close.triggered.connect(lambda: self.main_app.toggle_desktop_widget() if self.main_app else self.close())
+        menu.addAction(act_close)
+        
+        menu.exec(event.globalPos())
+
+# -------------------------------------------------------------
 # MAIN APP WINDOW
 # -------------------------------------------------------------
 class PCMonitorApp(QMainWindow):
@@ -1080,8 +1510,63 @@ class PCMonitorApp(QMainWindow):
         self.current_down_speed = 0.0
         self.current_up_speed = 0.0
         
+        # Initialize desktop widget reference
+        self.desktop_widget = None
+        
+        # Initialize SQLite database for power tracking
+        try:
+            self.db_conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.abspath(__file__)), "power_history.db"))
+            self.db_cursor = self.db_conn.cursor()
+            self.db_cursor.execute("""
+                CREATE TABLE IF NOT EXISTS power_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    wattage REAL
+                )
+            """)
+            self.db_cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+            self.db_conn.commit()
+            
+            # Load or set default EDC and Rent rates
+            self.db_cursor.execute("SELECT value FROM settings WHERE key='edc_rate'")
+            row = self.db_cursor.fetchone()
+            if row:
+                self.edc_rate = float(row[0])
+            else:
+                self.edc_rate = 610.0 # default
+                self.db_cursor.execute("INSERT INTO settings (key, value) VALUES ('edc_rate', '610.0')")
+                
+            self.db_cursor.execute("SELECT value FROM settings WHERE key='rent_rate'")
+            row = self.db_cursor.fetchone()
+            if row:
+                self.rent_rate = float(row[0])
+            else:
+                self.rent_rate = 1200.0 # default
+                self.db_cursor.execute("INSERT INTO settings (key, value) VALUES ('rent_rate', '1200.0')")
+                
+            # Load or set default border mode
+            self.db_cursor.execute("SELECT value FROM settings WHERE key='border_native'")
+            row = self.db_cursor.fetchone()
+            if row:
+                self.border_native = row[0] == 'True'
+            else:
+                self.border_native = True # Default to native resizable Zorin OS borders for full out-of-the-box responsiveness!
+                self.db_cursor.execute("INSERT INTO settings (key, value) VALUES ('border_native', 'True')")
+            self.db_conn.commit()
+        except Exception:
+            self.edc_rate = 610.0
+            self.rent_rate = 1200.0
+            self.border_native = True
+        
         # Setup Core UI layouts
         self.init_ui()
+        
+        # Setup System Tray Icon & Autostart
+        try:
+            self.setup_tray_icon()
+            self.setup_autostart()
+        except Exception:
+            pass
         
         # Apply initial styles and themes
         self.apply_styles()
@@ -1096,9 +1581,13 @@ class PCMonitorApp(QMainWindow):
         self.update_static_info()
         
     def init_ui(self):
-        # Translucent Background & Frameless macOS Window styling
+        # Translucent Background & Standard/Frameless Window styling
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
+        
+        if hasattr(self, 'border_native') and self.border_native:
+            self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.CustomizeWindowHint | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowSystemMenuHint | Qt.WindowType.WindowMinMaxButtonsHint | Qt.WindowType.WindowCloseButtonHint)
+        else:
+            self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
         
         # Completely transparent outer central canvas
         central_widget = QWidget(self)
@@ -1163,6 +1652,11 @@ class PCMonitorApp(QMainWindow):
         self.mac_max.clicked.connect(self.toggle_maximize)
         mac_dots_layout.addWidget(self.mac_max)
         
+        if hasattr(self, 'border_native') and self.border_native:
+            self.mac_close.hide()
+            self.mac_min.hide()
+            self.mac_max.hide()
+        
         mac_dots_layout.addStretch()
         sidebar_layout.addLayout(mac_dots_layout)
         
@@ -1209,18 +1703,23 @@ class PCMonitorApp(QMainWindow):
         sidebar_layout.addWidget(self.btn_net)
         self.nav_buttons.append(self.btn_net)
         
+        self.btn_power = SidebarButton("Power Analytics", "energy", sidebar)
+        self.btn_power.clicked.connect(lambda: self.switch_page(5))
+        sidebar_layout.addWidget(self.btn_power)
+        self.nav_buttons.append(self.btn_power)
+        
         self.btn_proc = SidebarButton("Processes", "processes", sidebar)
-        self.btn_proc.clicked.connect(lambda: self.switch_page(5))
+        self.btn_proc.clicked.connect(lambda: self.switch_page(6))
         sidebar_layout.addWidget(self.btn_proc)
         self.nav_buttons.append(self.btn_proc)
         
         self.btn_tune = SidebarButton("Tune-up", "tuneup", sidebar)
-        self.btn_tune.clicked.connect(lambda: self.switch_page(6))
+        self.btn_tune.clicked.connect(lambda: self.switch_page(7))
         sidebar_layout.addWidget(self.btn_tune)
         self.nav_buttons.append(self.btn_tune)
         
         self.btn_sett = SidebarButton("Settings", "settings", sidebar)
-        self.btn_sett.clicked.connect(lambda: self.switch_page(7))
+        self.btn_sett.clicked.connect(lambda: self.switch_page(8))
         sidebar_layout.addWidget(self.btn_sett)
         self.nav_buttons.append(self.btn_sett)
         
@@ -1242,6 +1741,7 @@ class PCMonitorApp(QMainWindow):
         self.create_memory_page()
         self.create_gpu_page()
         self.create_network_page()
+        self.create_power_page()
         self.create_processes_page()
         self.create_tuneup_page()
         self.create_settings_page()
@@ -1257,7 +1757,7 @@ class PCMonitorApp(QMainWindow):
             btn.setActive(i == index)
             
         # Proactively load/refresh active processes list when entering
-        if index == 5:
+        if index == 6:
             self.update_processes()
             
     # -------------------------------------------------------------
@@ -1280,6 +1780,12 @@ class PCMonitorApp(QMainWindow):
         self.lbl_dash_uptime = QLabel("Uptime: N/A", page)
         self.lbl_dash_uptime.setStyleSheet("color: #00F2FE; font-size: 11px; font-weight: 700; background-color: rgba(0, 242, 254, 0.1); border: 1px solid rgba(0, 242, 254, 0.2); border-radius: 12px; padding: 4px 12px;")
         header_layout.addWidget(self.lbl_dash_uptime)
+        
+        self.lbl_dash_widget_btn = QPushButton("WIDGET [OFF]", page)
+        self.lbl_dash_widget_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl_dash_widget_btn.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 700; background-color: rgba(100, 116, 139, 0.1); border: 1px solid rgba(100, 116, 139, 0.2); border-radius: 12px; padding: 4px 12px;")
+        self.lbl_dash_widget_btn.clicked.connect(self.toggle_desktop_widget)
+        header_layout.addWidget(self.lbl_dash_widget_btn)
         
         layout.addLayout(header_layout)
         
@@ -1385,6 +1891,42 @@ class PCMonitorApp(QMainWindow):
         self.lbl_dash_temp_val.setObjectName("stat_value")
         self.lbl_dash_temp_val.setStyleSheet("color: #ff416c; font-weight: 700;")
         sys_grid.addWidget(self.lbl_dash_temp_val, 4, 1)
+        
+        lbl_power_lbl = QLabel("Power Consumption:", self.card_sysinfo)
+        lbl_power_lbl.setObjectName("stat_label")
+        sys_grid.addWidget(lbl_power_lbl, 5, 0)
+        
+        self.lbl_dash_power_val = QLabel("Calculating...", self.card_sysinfo)
+        self.lbl_dash_power_val.setObjectName("stat_value")
+        self.lbl_dash_power_val.setStyleSheet("color: #ffb300; font-weight: 700;")
+        sys_grid.addWidget(self.lbl_dash_power_val, 5, 1)
+        
+        lbl_energy_lbl = QLabel("Today's Energy Use:", self.card_sysinfo)
+        lbl_energy_lbl.setObjectName("stat_label")
+        sys_grid.addWidget(lbl_energy_lbl, 6, 0)
+        
+        self.lbl_dash_energy_val = QLabel("Calculating...", self.card_sysinfo)
+        self.lbl_dash_energy_val.setObjectName("stat_value")
+        self.lbl_dash_energy_val.setStyleSheet("color: #00F2FE; font-weight: 700;")
+        sys_grid.addWidget(self.lbl_dash_energy_val, 6, 1)
+        
+        lbl_cost_edc_lbl = QLabel("Today's Cost (EDC):", self.card_sysinfo)
+        lbl_cost_edc_lbl.setObjectName("stat_label")
+        sys_grid.addWidget(lbl_cost_edc_lbl, 7, 0)
+        
+        self.lbl_dash_cost_edc_val = QLabel("Calculating...", self.card_sysinfo)
+        self.lbl_dash_cost_edc_val.setObjectName("stat_value")
+        self.lbl_dash_cost_edc_val.setStyleSheet("color: #00ff87; font-weight: 700;")
+        sys_grid.addWidget(self.lbl_dash_cost_edc_val, 7, 1)
+        
+        lbl_cost_rent_lbl = QLabel("Today's Cost (Rent):", self.card_sysinfo)
+        lbl_cost_rent_lbl.setObjectName("stat_label")
+        sys_grid.addWidget(lbl_cost_rent_lbl, 8, 0)
+        
+        self.lbl_dash_cost_rent_val = QLabel("Calculating...", self.card_sysinfo)
+        self.lbl_dash_cost_rent_val.setObjectName("stat_value")
+        self.lbl_dash_cost_rent_val.setStyleSheet("color: #00ff87; font-weight: 700;")
+        sys_grid.addWidget(self.lbl_dash_cost_rent_val, 8, 1)
         
         sysinfo_layout.addLayout(sys_grid)
         sysinfo_layout.addStretch()
@@ -2060,6 +2602,435 @@ class PCMonitorApp(QMainWindow):
         layout.addLayout(split_lay)
         self.stacked_widget.addWidget(page)
         
+    # -------------------------------------------------------------
+    # PAGE 6: POWER ANALYTICS
+    # -------------------------------------------------------------
+    def create_power_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(20)
+        
+        # Title and Live badge
+        header = QHBoxLayout()
+        title = QLabel("Power Analytics & Cambodia Costing", page)
+        title.setStyleSheet("color: #ffffff; font-size: 22px; font-weight: 800;")
+        header.addWidget(title)
+        header.addStretch()
+        
+        self.lbl_power_live_badge = QLabel("LIVE: 0.0 W", page)
+        self.lbl_power_live_badge.setStyleSheet("color: #ffb300; font-size: 12px; font-weight: 800; background-color: rgba(255, 179, 0, 0.1); border: 1px solid rgba(255, 179, 0, 0.2); border-radius: 12px; padding: 5px 15px;")
+        header.addWidget(self.lbl_power_live_badge)
+        layout.addLayout(header)
+        
+        # Configuration Row for custom Cambodia rates
+        config_card = QFrame(page)
+        config_card.setObjectName("card")
+        config_card.setStyleSheet("QFrame#card { background-color: rgba(30, 41, 59, 0.25); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 12px; }")
+        config_lay = QHBoxLayout(config_card)
+        config_lay.setContentsMargins(15, 10, 15, 10)
+        config_lay.setSpacing(15)
+        
+        cfg_icon = QLabel("⚙️", config_card)
+        cfg_icon.setStyleSheet("font-size: 16px;")
+        config_lay.addWidget(cfg_icon)
+        
+        cfg_title = QLabel("Cambodia Tariff Setup:", config_card)
+        cfg_title.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: 700;")
+        config_lay.addWidget(cfg_title)
+        
+        # EDC Rate Spinner
+        config_lay.addStretch()
+        lbl_edc_cfg = QLabel("EDC Rate (KHR/kWh):", config_card)
+        lbl_edc_cfg.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600;")
+        config_lay.addWidget(lbl_edc_cfg)
+        
+        self.spin_edc = QSpinBox(config_card)
+        self.spin_edc.setRange(100, 5000)
+        self.spin_edc.setValue(int(self.edc_rate))
+        self.spin_edc.setSuffix(" KHR")
+        self.spin_edc.setStyleSheet("""
+            QSpinBox {
+                background-color: rgba(15, 23, 42, 0.6);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 6px;
+                color: #00ff87;
+                font-weight: 700;
+                padding: 3px 8px;
+                min-width: 90px;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                width: 0px;
+            }
+        """)
+        config_lay.addWidget(self.spin_edc)
+        
+        # Rent Rate Spinner
+        lbl_rent_cfg = QLabel("Rental Rate (KHR/kWh):", config_card)
+        lbl_rent_cfg.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600;")
+        config_lay.addWidget(lbl_rent_cfg)
+        
+        self.spin_rent = QSpinBox(config_card)
+        self.spin_rent.setRange(100, 5000)
+        self.spin_rent.setValue(int(self.rent_rate))
+        self.spin_rent.setSuffix(" KHR")
+        self.spin_rent.setStyleSheet("""
+            QSpinBox {
+                background-color: rgba(15, 23, 42, 0.6);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 6px;
+                color: #ffb300;
+                font-weight: 700;
+                padding: 3px 8px;
+                min-width: 90px;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                width: 0px;
+            }
+        """)
+        config_lay.addWidget(self.spin_rent)
+        
+        self.spin_edc.valueChanged.connect(self.on_tariff_rates_changed)
+        self.spin_rent.valueChanged.connect(self.on_tariff_rates_changed)
+        
+        layout.addWidget(config_card)
+        
+        # Info row (3 cards)
+        cards_layout = QHBoxLayout()
+        cards_layout.setSpacing(15)
+        
+        # Card 1: Hour Stats
+        card_hour = QFrame(page)
+        card_hour.setObjectName("card")
+        ch_layout = QVBoxLayout(card_hour)
+        ch_layout.setContentsMargins(15, 15, 15, 15)
+        lbl_h_title = QLabel("REAL-TIME ESTIMATED LOAD", card_hour)
+        lbl_h_title.setStyleSheet("color: #94a3b8; font-size: 9px; font-weight: 800; letter-spacing: 1px;")
+        ch_layout.addWidget(lbl_h_title)
+        self.lbl_power_stat_hour = QLabel("0.0 W", card_hour)
+        self.lbl_power_stat_hour.setStyleSheet("color: #ffb300; font-size: 24px; font-weight: 800; margin-top: 5px;")
+        ch_layout.addWidget(self.lbl_power_stat_hour)
+        cards_layout.addWidget(card_hour)
+        
+        # Card 2: Day Stats
+        card_day = QFrame(page)
+        card_day.setObjectName("card")
+        cd_layout = QVBoxLayout(card_day)
+        cd_layout.setContentsMargins(15, 15, 15, 15)
+        lbl_d_title = QLabel("ACTUAL TODAY'S ENERGY (PHNOM PENH)", card_day)
+        lbl_d_title.setStyleSheet("color: #94a3b8; font-size: 9px; font-weight: 800; letter-spacing: 1px;")
+        cd_layout.addWidget(lbl_d_title)
+        self.lbl_power_stat_day = QLabel("0.000 kWh", card_day)
+        self.lbl_power_stat_day.setStyleSheet("color: #00F2FE; font-size: 24px; font-weight: 800; margin-top: 5px;")
+        cd_layout.addWidget(self.lbl_power_stat_day)
+        cards_layout.addWidget(card_day)
+        
+        # Card 3: Historical Sum
+        card_hist = QFrame(page)
+        card_hist.setObjectName("card")
+        ci_layout = QVBoxLayout(card_hist)
+        ci_layout.setContentsMargins(15, 15, 15, 15)
+        lbl_hi_title = QLabel("ACCUMULATED ENERGY (DATABASE)", card_hist)
+        lbl_hi_title.setStyleSheet("color: #94a3b8; font-size: 9px; font-weight: 800; letter-spacing: 1px;")
+        ci_layout.addWidget(lbl_hi_title)
+        self.lbl_power_stat_hist = QLabel("0.000 kWh", card_hist)
+        self.lbl_power_stat_hist.setStyleSheet("color: #00ff87; font-size: 24px; font-weight: 800; margin-top: 5px;")
+        ci_layout.addWidget(self.lbl_power_stat_hist)
+        cards_layout.addWidget(card_hist)
+        
+        layout.addLayout(cards_layout)
+        
+        # Cost and History Split Layout
+        split_tables = QHBoxLayout()
+        split_tables.setSpacing(20)
+        
+        # Left Panel: Cambodia Cost Tables Card
+        cost_card = QFrame(page)
+        cost_card.setObjectName("card")
+        cc_layout = QVBoxLayout(cost_card)
+        cc_layout.setContentsMargins(15, 15, 15, 15)
+        cc_layout.setSpacing(12)
+        cc_title = QLabel("TARIFF PROJECTIONS (EDC VS RENT)", cost_card)
+        cc_title.setObjectName("card_title")
+        cc_layout.addWidget(cc_title)
+        
+        cost_table = QTableWidget(cost_card)
+        cost_table.setColumnCount(6)
+        cost_table.setRowCount(4)
+        cost_table.setHorizontalHeaderLabels([
+            "Period", "Est. Energy", "EDC Cost (KHR)", "EDC Cost (USD)", "Rent Cost (KHR)", "Rent Cost (USD)"
+        ])
+        cost_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        cost_table.verticalHeader().setVisible(False)
+        cost_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        cost_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        cost_table.setShowGrid(False)
+        cost_table.setStyleSheet("""
+            QTableWidget {
+                background-color: transparent;
+                gridline-color: transparent;
+                color: #e2e8f0;
+                font-size: 10px;
+                border: none;
+            }
+            QHeaderView::section {
+                background-color: rgba(30, 41, 59, 0.42);
+                color: #94a3b8;
+                padding: 6px;
+                border: none;
+                font-weight: 800;
+                font-size: 9px;
+                text-transform: uppercase;
+            }
+            QTableWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            }
+        """)
+        
+        self.cost_table = cost_table
+        cc_layout.addWidget(cost_table)
+        split_tables.addWidget(cost_card, stretch=6)
+        
+        # Right Panel: Daily History Logs Card
+        hist_card = QFrame(page)
+        hist_card.setObjectName("card")
+        hc_layout = QVBoxLayout(hist_card)
+        hc_layout.setContentsMargins(15, 15, 15, 15)
+        hc_layout.setSpacing(12)
+        hc_title = QLabel("DAILY HISTORY LOGS (UTC+7 PHNOM PENH)", hist_card)
+        hc_title.setObjectName("card_title")
+        hc_layout.addWidget(hc_title)
+        
+        self.history_table = QTableWidget(hist_card)
+        self.history_table.setColumnCount(4)
+        self.history_table.setRowCount(7)
+        self.history_table.setHorizontalHeaderLabels([
+            "Day / Date", "Energy Used", "EDC Cost", "Rent Cost"
+        ])
+        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.history_table.verticalHeader().setVisible(False)
+        self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.history_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.history_table.setShowGrid(False)
+        self.history_table.setStyleSheet("""
+            QTableWidget {
+                background-color: transparent;
+                gridline-color: transparent;
+                color: #e2e8f0;
+                font-size: 10px;
+                border: none;
+            }
+            QHeaderView::section {
+                background-color: rgba(30, 41, 59, 0.42);
+                color: #94a3b8;
+                padding: 6px;
+                border: none;
+                font-weight: 800;
+                font-size: 9px;
+                text-transform: uppercase;
+            }
+            QTableWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            }
+        """)
+        
+        hc_layout.addWidget(self.history_table)
+        split_tables.addWidget(hist_card, stretch=5)
+        
+        layout.addLayout(split_tables)
+        
+        # Live Load Graph
+        graph_card = QFrame(page)
+        graph_card.setObjectName("card")
+        g_layout = QVBoxLayout(graph_card)
+        g_layout.setContentsMargins(20, 20, 20, 20)
+        
+        g_title = QLabel("LIVE POWER LOAD HISTOGRAM (WATTS)", graph_card)
+        g_title.setObjectName("card_title")
+        g_layout.addWidget(g_title)
+        
+        self.graph_power = RealTimeGraph(graph_card, title="Power Usage (Watts)", color=QColor("#ffb300"))
+        g_layout.addWidget(self.graph_power)
+        layout.addWidget(graph_card)
+        
+        self.stacked_widget.addWidget(page)
+
+    def update_power_page_data(self, watts):
+        # Update live badges
+        if hasattr(self, 'lbl_power_live_badge'):
+            self.lbl_power_live_badge.setText(f"LIVE: {watts:.1f} W")
+        if hasattr(self, 'lbl_power_stat_hour'):
+            self.lbl_power_stat_hour.setText(f"{watts:.1f} W")
+            
+        # Get actual energy used today in local timezone (UTC+7 Phnom Penh)
+        today_kwh = 0.0
+        try:
+            self.db_cursor.execute("SELECT SUM(wattage) FROM power_logs WHERE date(timestamp, '+7 hours') = date('now', '+7 hours')")
+            today_watt_sum = self.db_cursor.fetchone()[0]
+            if today_watt_sum is not None:
+                today_kwh = today_watt_sum * (10.0 / 3600.0) / 1000.0
+        except Exception:
+            pass
+            
+        if hasattr(self, 'lbl_power_stat_day'):
+            self.lbl_power_stat_day.setText(f"{today_kwh:.4f} kWh")
+            
+        daily_kwh = watts * 0.024
+            
+        # Get historical sum from database
+        hist_kwh = 0.0
+        try:
+            self.db_cursor.execute("SELECT SUM(wattage) FROM power_logs")
+            total_watt_sum = self.db_cursor.fetchone()[0]
+            if total_watt_sum is not None:
+                hist_kwh = total_watt_sum * (10.0 / 3600.0) / 1000.0
+        except Exception:
+            pass
+            
+        if hasattr(self, 'lbl_power_stat_hist'):
+            self.lbl_power_stat_hist.setText(f"{hist_kwh:.4f} kWh")
+            
+        # Add values to graph
+        if hasattr(self, 'graph_power'):
+            self.graph_power.addValue(watts)
+            
+        # Populate Cambodia Cost Table
+        periods = [
+            ("Per Hour", watts / 1000.0, 1.0),
+            ("Per Day", daily_kwh, 24.0),
+            ("Per Week", daily_kwh * 7.0, 168.0),
+            ("Per Month (30d)", daily_kwh * 30.0, 720.0)
+        ]
+        
+        for row_idx, (period_name, energy_val, hours_multiplier) in enumerate(periods):
+            # 1. Period Name
+            item_period = QTableWidgetItem(period_name)
+            item_period.setForeground(QColor("#94a3b8"))
+            item_period.setFont(QFont("Inter", 9, QFont.Weight.Bold))
+            self.cost_table.setItem(row_idx, 0, item_period)
+            
+            # 2. Energy kWh
+            item_energy = QTableWidgetItem(f"{energy_val:.4f} kWh")
+            item_energy.setForeground(QColor("#00F2FE"))
+            self.cost_table.setItem(row_idx, 1, item_energy)
+            
+            # 3. EDC Cost KHR
+            edc_khr = energy_val * self.edc_rate
+            item_edc_khr = QTableWidgetItem(f"{int(edc_khr)} KHR")
+            item_edc_khr.setForeground(QColor("#00ff87"))
+            self.cost_table.setItem(row_idx, 2, item_edc_khr)
+            
+            # 4. EDC Cost USD
+            edc_usd = edc_khr / 4100.0
+            item_edc_usd = QTableWidgetItem(f"${edc_usd:.3f}" if edc_usd < 0.05 else f"${edc_usd:.2f}")
+            item_edc_usd.setForeground(QColor("#00ff87"))
+            self.cost_table.setItem(row_idx, 3, item_edc_usd)
+            
+            # 5. Rent Cost KHR
+            rent_khr = energy_val * self.rent_rate
+            item_rent_khr = QTableWidgetItem(f"{int(rent_khr)} KHR")
+            item_rent_khr.setForeground(QColor("#ffb300"))
+            self.cost_table.setItem(row_idx, 4, item_rent_khr)
+            
+            # 6. Rent Cost USD
+            rent_usd = rent_khr / 4100.0
+            item_rent_usd = QTableWidgetItem(f"${rent_usd:.3f}" if rent_usd < 0.05 else f"${rent_usd:.2f}")
+            item_rent_usd.setForeground(QColor("#ffb300"))
+            self.cost_table.setItem(row_idx, 5, item_rent_usd)
+            
+        # Populate Daily History Logs from Database (grouped by calendar day in UTC+7)
+        if hasattr(self, 'history_table'):
+            try:
+                self.db_cursor.execute("""
+                    SELECT 
+                        date(timestamp, '+7 hours') as day,
+                        SUM(wattage) as watt_sum
+                    FROM power_logs
+                    GROUP BY day
+                    ORDER BY day DESC
+                    LIMIT 7
+                """)
+                rows = self.db_cursor.fetchall()
+                self.history_table.setRowCount(max(7, len(rows)))
+                
+                # Fill empty slots as N/A placeholders initially
+                for empty_row in range(self.history_table.rowCount()):
+                    for col in range(self.history_table.columnCount()):
+                        self.history_table.setItem(empty_row, col, QTableWidgetItem("N/A"))
+                
+                for r_idx, r_data in enumerate(rows):
+                    day_str = r_data[0]
+                    w_sum = r_data[1]
+                    if w_sum is None:
+                        w_sum = 0.0
+                    
+                    # Convert '2026-05-27' to weekday format 'Wed, May 27'
+                    from datetime import datetime
+                    try:
+                        dt_obj = datetime.strptime(day_str, "%Y-%m-%d")
+                        current_date_str = datetime.now().strftime("%Y-%m-%d")
+                        if day_str == current_date_str:
+                            display_day = dt_obj.strftime("%a, %b %d") + " (Today)"
+                        else:
+                            display_day = dt_obj.strftime("%a, %b %d")
+                    except Exception:
+                        display_day = day_str
+                        
+                    # Energy = sum of logged wattages * 10 seconds / 3600 / 1000
+                    h_kwh = w_sum * (10.0 / 3600.0) / 1000.0
+                    
+                    # Row 1: Day
+                    item_day = QTableWidgetItem(display_day)
+                    item_day.setForeground(QColor("#ffffff"))
+                    item_day.setFont(QFont("Inter", 9, QFont.Weight.Bold))
+                    self.history_table.setItem(r_idx, 0, item_day)
+                    
+                    # Row 2: kWh
+                    item_kwh = QTableWidgetItem(f"{h_kwh:.4f} kWh")
+                    item_kwh.setForeground(QColor("#00F2FE"))
+                    self.history_table.setItem(r_idx, 1, item_kwh)
+                    
+                    # Row 3: EDC KHR
+                    edc_k = h_kwh * self.edc_rate
+                    edc_u = edc_k / 4100.0
+                    item_edc_c = QTableWidgetItem(f"{int(edc_k)} KHR (~${edc_u:.2f})")
+                    item_edc_c.setForeground(QColor("#00ff87"))
+                    self.history_table.setItem(r_idx, 2, item_edc_c)
+                    
+                    # Row 4: Rent KHR
+                    rent_k = h_kwh * self.rent_rate
+                    rent_u = rent_k / 4100.0
+                    item_rent_c = QTableWidgetItem(f"{int(rent_k)} KHR (~${rent_u:.2f})")
+                    item_rent_c.setForeground(QColor("#ffb300"))
+                    self.history_table.setItem(r_idx, 3, item_rent_c)
+            except Exception:
+                pass
+                
+    def on_tariff_rates_changed(self):
+        self.edc_rate = float(self.spin_edc.value())
+        self.rent_rate = float(self.spin_rent.value())
+        
+        # Save to database
+        try:
+            self.db_cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('edc_rate', ?)", (str(self.edc_rate),))
+            self.db_cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('rent_rate', ?)", (str(self.rent_rate),))
+            self.db_conn.commit()
+        except Exception:
+            pass
+            
+        # Trigger an immediate recalculation of all active displays
+        watts = 0.0
+        if hasattr(self, 'lbl_dash_power_val'):
+            try:
+                watts_str = self.lbl_dash_power_val.text().replace("⚡", "").replace("W", "").strip()
+                watts = float(watts_str)
+            except Exception:
+                watts = 12.5
+        
+        self.update_power_page_data(watts)
+        
     def start_speedtest(self):
         self.btn_run_test.setEnabled(False)
         self.btn_run_test.setText("RUNNING TEST...")
@@ -2364,6 +3335,84 @@ class PCMonitorApp(QMainWindow):
         uptime_parts.append(f"{seconds}s")
         uptime_str = "Uptime: " + " ".join(uptime_parts)
         self.lbl_dash_uptime.setText(uptime_str)
+        
+        # 9. Update Dashboard Power consumption
+        if hasattr(self, 'lbl_dash_power_val'):
+            if hasattr(self, 'desktop_widget') and self.desktop_widget is not None:
+                watts = self.desktop_widget.get_power_usage()
+            else:
+                hw_power = get_hardware_power_usage()
+                if hw_power is not None:
+                    watts = hw_power
+                else:
+                    try:
+                        cpu_usage = psutil.cpu_percent()
+                        cpu_model = get_cpu_model()
+                        def get_cpu_tdp(model_name):
+                            model_lower = model_name.lower()
+                            if "u" in model_lower or "y" in model_lower or "g1" in model_lower or "g4" in model_lower or "g7" in model_lower:
+                                return 15.0, 25.0
+                            elif "h" in model_lower or "hq" in model_lower or "hs" in model_lower:
+                                return 35.0, 54.0
+                            elif "t" in model_lower:
+                                return 35.0, 50.0
+                            else:
+                                return 65.0, 125.0
+                        base, peak = get_cpu_tdp(cpu_model)
+                        idle_power = base * 0.08
+                        freq_ratio = 1.0
+                        freq_info = psutil.cpu_freq()
+                        if freq_info and freq_info.max > 0:
+                            freq_ratio = freq_info.current / freq_info.max
+                        load_factor = (cpu_usage / 100.0) ** 1.3
+                        freq_factor = freq_ratio ** 1.5
+                        active_power = (peak - idle_power) * load_factor * freq_factor
+                        watts = max(3.5, min(idle_power + active_power, peak * 1.5))
+                    except Exception:
+                        watts = 12.5
+            self.lbl_dash_power_val.setText(f"⚡ {watts:.1f} W")
+            
+            # Save power usage to database every 10 seconds
+            if not hasattr(self, 'last_db_log_time'):
+                self.last_db_log_time = 0
+            current_time = time.time()
+            if current_time - self.last_db_log_time >= 10.0:
+                try:
+                    self.db_cursor.execute("INSERT INTO power_logs (wattage) VALUES (?)", (watts,))
+                    self.db_conn.commit()
+                    self.last_db_log_time = current_time
+                except Exception:
+                    pass
+            
+            # Update Power Page values
+            if hasattr(self, 'update_power_page_data'):
+                self.update_power_page_data(watts)
+            
+            # Today's actual energy from database (Phnom Penh time UTC+7)
+            today_kwh = 0.0
+            try:
+                self.db_cursor.execute("SELECT SUM(wattage) FROM power_logs WHERE date(timestamp, '+7 hours') = date('now', '+7 hours')")
+                today_watt_sum = self.db_cursor.fetchone()[0]
+                if today_watt_sum is not None:
+                    today_kwh = today_watt_sum * (10.0 / 3600.0) / 1000.0
+            except Exception:
+                pass
+                
+            if hasattr(self, 'lbl_dash_energy_val'):
+                self.lbl_dash_energy_val.setText(f"{today_kwh:.4f} kWh")
+                
+            # Cambodia EDC official price: 610 KHR per kWh (~$0.15)
+            # Exchange rate USD/KHR: ~4100 Riels per Dollar
+            edc_khr = today_kwh * 610.0
+            edc_usd = edc_khr / 4100.0
+            if hasattr(self, 'lbl_dash_cost_edc_val'):
+                self.lbl_dash_cost_edc_val.setText(f"{int(edc_khr)} KHR (~${edc_usd:.2f})")
+                
+            # Cambodia Rental/Surcharge price: 1200 KHR per kWh (~$0.29)
+            rent_khr = today_kwh * 1200.0
+            rent_usd = rent_khr / 4100.0
+            if hasattr(self, 'lbl_dash_cost_rent_val'):
+                self.lbl_dash_cost_rent_val.setText(f"{int(rent_khr)} KHR (~${rent_usd:.2f})")
         
     def update_static_info(self):
         # These properties only change on boot/hardware swap, so update them once
@@ -2888,6 +3937,42 @@ class PCMonitorApp(QMainWindow):
         
         layout.addWidget(glass_card)
         
+        # WINDOW BORDERS & RESPONSIVENESS CARD
+        border_card = QFrame(page)
+        border_card.setObjectName("card")
+        bc_layout = QVBoxLayout(border_card)
+        bc_layout.setContentsMargins(20, 20, 20, 20)
+        bc_layout.setSpacing(15)
+        
+        bc_title = QLabel("WINDOW BORDERS & RESPONSIVE SNAPPING", border_card)
+        bc_title.setObjectName("card_title")
+        bc_layout.addWidget(bc_title)
+        
+        bc_desc = QLabel("Choose between a sleek custom macOS-style borderless window, or native resizable window borders. Native mode enables full Zorin OS desktop corner snapping, tiling, standard system sizing, and 100% responsiveness.", border_card)
+        bc_desc.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 500;")
+        bc_desc.setWordWrap(True)
+        bc_layout.addWidget(bc_desc)
+        
+        border_btn_layout = QHBoxLayout()
+        border_btn_layout.setSpacing(15)
+        
+        self.btn_border_native = QPushButton("NATIVE MODE (SNAPPABLE / RESPONSIVE)", border_card)
+        self.btn_border_native.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_border_native.setMinimumHeight(44)
+        
+        self.btn_border_custom = QPushButton("CUSTOM MODE (SLEEK)", border_card)
+        self.btn_border_custom.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_border_custom.setMinimumHeight(44)
+        
+        self.btn_border_native.clicked.connect(lambda: self.set_window_border_mode(True))
+        self.btn_border_custom.clicked.connect(lambda: self.set_window_border_mode(False))
+        
+        border_btn_layout.addWidget(self.btn_border_native)
+        border_btn_layout.addWidget(self.btn_border_custom)
+        bc_layout.addLayout(border_btn_layout)
+        
+        layout.addWidget(border_card)
+        
         sys_card = QFrame(page)
         sys_card.setObjectName("card")
         sc_layout = QVBoxLayout(sys_card)
@@ -2907,11 +3992,48 @@ class PCMonitorApp(QMainWindow):
         sc_layout.addWidget(lbl_status)
         
         layout.addWidget(sys_card)
+        
+        # DESKTOP COMPANION WIDGET CARD
+        widget_card = QFrame(page)
+        widget_card.setObjectName("card")
+        wc_layout = QVBoxLayout(widget_card)
+        wc_layout.setContentsMargins(20, 20, 20, 20)
+        wc_layout.setSpacing(15)
+        
+        wc_title = QLabel("DESKTOP COMPANION WIDGET (DESKLET)", widget_card)
+        wc_title.setObjectName("card_title")
+        wc_layout.addWidget(wc_title)
+        
+        wc_desc = QLabel("Enable a premium, compact floating desktop widget that stays on your Zorin desktop. It shows real-time CPU %, RAM %, and power usage in Watts (W) with fluid glassmorphic visuals.", widget_card)
+        wc_desc.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 500;")
+        wc_desc.setWordWrap(True)
+        wc_layout.addWidget(wc_desc)
+        
+        widget_btn_layout = QHBoxLayout()
+        widget_btn_layout.setSpacing(15)
+        
+        self.btn_widget_toggle = QPushButton("DESKTOP WIDGET (OFF)", widget_card)
+        self.btn_widget_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_widget_toggle.setMinimumHeight(44)
+        self.btn_widget_toggle.clicked.connect(self.toggle_desktop_widget)
+        widget_btn_layout.addWidget(self.btn_widget_toggle)
+        
+        # Option to toggle always-on-top or on-bottom
+        self.btn_widget_layer = QPushButton("LAYER: STAY ON BOTTOM (DESKLET)", widget_card)
+        self.btn_widget_layer.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_widget_layer.setMinimumHeight(44)
+        self.btn_widget_layer.clicked.connect(self.toggle_widget_layer_settings)
+        widget_btn_layout.addWidget(self.btn_widget_layer)
+        
+        wc_layout.addLayout(widget_btn_layout)
+        layout.addWidget(widget_card)
+        
         layout.addStretch()
         self.stacked_widget.addWidget(page)
         
-        # Initialize transparency buttons active style
+        # Initialize transparency and border buttons active styles
         self.update_transparency_buttons()
+        self.update_border_buttons_style()
         
     def apply_theme_colors(self, theme_name):
         self.current_theme = theme_name
@@ -2919,6 +4041,10 @@ class PCMonitorApp(QMainWindow):
         
         # Active Net cards rebuilds
         self.rebuild_network_interfaces()
+        
+        # Re-apply styles to desktop widget if open
+        if hasattr(self, 'desktop_widget') and self.desktop_widget is not None:
+            self.desktop_widget.update_styles()
         
     def set_transparency(self, enabled):
         self.transparency_enabled = enabled
@@ -2970,6 +4096,81 @@ class PCMonitorApp(QMainWindow):
         else:
             self.btn_trans_on.setStyleSheet(inactive_style)
             self.btn_trans_off.setStyleSheet(active_style)
+            
+    def set_window_border_mode(self, native):
+        self.border_native = native
+        try:
+            self.db_cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('border_native', ?)", (str(native),))
+            self.db_conn.commit()
+        except Exception:
+            pass
+            
+        # Re-apply window state changes in PyQt (requires resetting window flags and showing)
+        if native:
+            self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.CustomizeWindowHint | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowSystemMenuHint | Qt.WindowType.WindowMinMaxButtonsHint | Qt.WindowType.WindowCloseButtonHint)
+            if hasattr(self, 'mac_close'):
+                self.mac_close.hide()
+            if hasattr(self, 'mac_min'):
+                self.mac_min.hide()
+            if hasattr(self, 'mac_max'):
+                self.mac_max.hide()
+        else:
+            self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
+            if hasattr(self, 'mac_close'):
+                self.mac_close.show()
+            if hasattr(self, 'mac_min'):
+                self.mac_min.show()
+            if hasattr(self, 'mac_max'):
+                self.mac_max.show()
+                
+        self.show()
+        self.update_border_buttons_style()
+        
+    def update_border_buttons_style(self):
+        if not hasattr(self, 'btn_border_native') or not hasattr(self, 'btn_border_custom'):
+            return
+            
+        colors = self.theme_palettes.get(self.current_theme, self.theme_palettes["Spectra Blue"])
+        grad_str = colors["grad"]
+        p_rgb = colors["accent_rgb"]
+        
+        active_style = f"""
+            QPushButton {{
+                background: {grad_str};
+                color: #080c14;
+                font-size: 11px;
+                font-weight: 800;
+                border: 1px solid rgba(255,255,255,0.06);
+                border-radius: 8px;
+                padding: 8px 16px;
+            }}
+            QPushButton:hover {{
+                border: 2px solid #ffffff;
+            }}
+        """
+        
+        inactive_style = f"""
+            QPushButton {{
+                background: rgba(30, 41, 59, 0.42);
+                color: #94a3b8;
+                font-size: 11px;
+                font-weight: 800;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 8px;
+                padding: 8px 16px;
+            }}
+            QPushButton:hover {{
+                border: 1px solid rgba({p_rgb}, 0.25);
+                background-color: rgba(30, 41, 59, 0.55);
+            }}
+        """
+        
+        if self.border_native:
+            self.btn_border_native.setStyleSheet(active_style)
+            self.btn_border_custom.setStyleSheet(inactive_style)
+        else:
+            self.btn_border_native.setStyleSheet(inactive_style)
+            self.btn_border_custom.setStyleSheet(active_style)
             
     def apply_styles(self):
         # 1. Start with the base QSS_STYLING
@@ -3028,6 +4229,9 @@ class PCMonitorApp(QMainWindow):
     # MACOS WINDOW DRAGGING & MAXIMIZE INTERACTION HANDLERS
     # -------------------------------------------------------------
     def get_resize_zone(self, global_pos):
+        if hasattr(self, 'border_native') and self.border_native:
+            return None
+            
         pos_in_window = self.mapFromGlobal(global_pos)
         x = pos_in_window.x()
         y = pos_in_window.y()
@@ -3161,6 +4365,98 @@ class PCMonitorApp(QMainWindow):
         else:
             self.showMaximized()
 
+    def toggle_desktop_widget(self):
+        if self.desktop_widget is None:
+            self.desktop_widget = SpectraDesktopWidget(self)
+            self.desktop_widget.show()
+            if hasattr(self, 'btn_widget_toggle'):
+                self.btn_widget_toggle.setText("DESKTOP WIDGET (ON)")
+            if hasattr(self, 'lbl_dash_widget_btn'):
+                self.lbl_dash_widget_btn.setText("WIDGET [ON]")
+                self.lbl_dash_widget_btn.setStyleSheet("color: #00ff87; font-size: 11px; font-weight: 700; background-color: rgba(0, 255, 135, 0.1); border: 1px solid rgba(0, 255, 135, 0.2); border-radius: 12px; padding: 4px 12px;")
+            if hasattr(self, 'btn_widget_layer'):
+                if self.desktop_widget.stays_on_top:
+                    self.btn_widget_layer.setText("LAYER: ALWAYS ON TOP")
+                else:
+                    self.btn_widget_layer.setText("LAYER: STAY ON BOTTOM (DESKLET)")
+        else:
+            self.desktop_widget.close()
+            self.desktop_widget = None
+            if hasattr(self, 'btn_widget_toggle'):
+                self.btn_widget_toggle.setText("DESKTOP WIDGET (OFF)")
+            if hasattr(self, 'lbl_dash_widget_btn'):
+                self.lbl_dash_widget_btn.setText("WIDGET [OFF]")
+                self.lbl_dash_widget_btn.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 700; background-color: rgba(100, 116, 139, 0.1); border: 1px solid rgba(100, 116, 139, 0.2); border-radius: 12px; padding: 4px 12px;")
+
+    def toggle_widget_layer_settings(self):
+        if hasattr(self, 'desktop_widget') and self.desktop_widget is not None:
+            self.desktop_widget.toggle_stays_on_top()
+            if self.desktop_widget.stays_on_top:
+                self.btn_widget_layer.setText("LAYER: ALWAYS ON TOP")
+            else:
+                self.btn_widget_layer.setText("LAYER: STAY ON BOTTOM (DESKLET)")
+        else:
+            QMessageBox.information(self, "Widget Inactive", "Please enable the Desktop Widget first to change its display layer.")
+            
+    def setup_tray_icon(self):
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self.windowIcon())
+        
+        tray_menu = QMenu()
+        show_action = tray_menu.addAction("Show Spectra Monitor")
+        show_action.triggered.connect(self.showNormal)
+        
+        quit_action = tray_menu.addAction("Quit")
+        quit_action.triggered.connect(QApplication.instance().quit)
+        
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.show()
+        
+        self.tray_icon.activated.connect(self.on_tray_icon_activated)
+
+    def on_tray_icon_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick or reason == QSystemTrayIcon.ActivationReason.Trigger:
+            if self.isVisible():
+                self.hide()
+            else:
+                self.showNormal()
+                self.raise_()
+                self.activateWindow()
+
+    def closeEvent(self, event):
+        if hasattr(self, 'tray_icon') and self.tray_icon.isVisible():
+            self.hide()
+            self.tray_icon.showMessage(
+                "Spectra PC Monitor",
+                "App is still running in the background to log your power usage!",
+                QSystemTrayIcon.MessageIcon.Information,
+                2000
+            )
+            event.ignore()
+        else:
+            event.accept()
+
+    def setup_autostart(self):
+        try:
+            autostart_dir = os.path.expanduser("~/.config/autostart")
+            os.makedirs(autostart_dir, exist_ok=True)
+            desktop_file = os.path.join(autostart_dir, "spectra_monitor.desktop")
+            
+            script_path = os.path.abspath(__file__)
+            content = f"""[Desktop Entry]
+Type=Application
+Exec=python3 "{script_path}" --minimized
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+Name=Spectra PC Monitor
+Comment=Log PC power usage in background
+"""
+            with open(desktop_file, "w") as f:
+                f.write(content)
+        except Exception:
+            pass
+
 # -------------------------------------------------------------
 # MAIN APP LAUNCH ENTRY
 # -------------------------------------------------------------
@@ -3173,5 +4469,8 @@ if __name__ == "__main__":
     app.setFont(font)
     
     window = PCMonitorApp()
-    window.show()
+    if "--minimized" in sys.argv:
+        window.hide()
+    else:
+        window.show()
     sys.exit(app.exec())
