@@ -20,4 +20,5 @@ dist/
 .DS_Store
 Thumbs.db
 
-
+# Databases
+power_history.db
