@@ -27,9 +27,9 @@ jobs:
             pyinstaller_cmd: pyinstaller --onefile --windowed --name="SpectraMonitor-Windows" --add-data "app_icon.png;." --noconfirm --clean main.py
             output_binary: dist/SpectraMonitor-Windows.exe
           - os: macos-latest
-            artifact_name: SpectraMonitor-macOS.app
+            artifact_name: SpectraMonitor-macOS.dmg
             pyinstaller_cmd: pyinstaller --onefile --windowed --name="SpectraMonitor-macOS" --add-data "app_icon.png:." --noconfirm --clean main.py
-            output_binary: dist/SpectraMonitor-macOS.app
+            output_binary: dist/SpectraMonitor-macOS.dmg
 
     steps:
     - name: Checkout Code
@@ -49,18 +49,17 @@ jobs:
     - name: Build with PyInstaller
       run: ${{ matrix.pyinstaller_cmd }}
 
-    # Zip macOS .app bundle to preserve its internal directory structure
-    - name: Compress macOS app bundle
+    # Package macOS .app bundle into a native .dmg Disk Image
+    - name: Create macOS DMG Installer
       if: matrix.os == 'macos-latest'
       run: |
-        ditto -c -k --sequesterRsrc dist/SpectraMonitor-macOS.app dist/SpectraMonitor-macOS.zip
+        hdiutil create -fs HFS+ -srcfolder dist/SpectraMonitor-macOS.app -volname "Spectra PC Monitor" dist/SpectraMonitor-macOS.dmg
 
     - name: Upload Build Artifact
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact_name }}
-        path: |
-          ${{ matrix.os == 'macos-latest' && 'dist/SpectraMonitor-macOS.zip' || matrix.output_binary }}
+        path: ${{ matrix.output_binary }}
 
   release:
     name: Create GitHub Release
@@ -79,7 +78,7 @@ jobs:
         files: |
           artifacts/SpectraMonitor-Linux/SpectraMonitor-Linux
           artifacts/SpectraMonitor-Windows.exe/SpectraMonitor-Windows.exe
-          artifacts/SpectraMonitor-macOS.app/SpectraMonitor-macOS.zip
+          artifacts/SpectraMonitor-macOS.dmg/SpectraMonitor-macOS.dmg
         draft: false
         prerelease: false
       env:
